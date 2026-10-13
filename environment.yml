@@ -1,0 +1,11 @@
+name: muri-sea
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - numpy
+  - pandas
+  - xarray
+  - netcdf4
+  - bokeh
+  - cmocean

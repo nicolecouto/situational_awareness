@@ -1,0 +1,93 @@
+# Situational awareness dashboard
+
+2026 October 10, written for cruise RR2609 (R/V Roger Revelle).
+
+A live browser dashboard to keep open during the cruise. It shows:
+
+- **Map:** the ship track over bathymetry for the chosen time window, colored by SST, TSG temperature, salinity, fluorescence, ship speed, or ADCP current speed. Optional ADCP current vectors (shallowest good bin, or averaged over a chosen depth range). A blue circle marks the start of the window shown, a red circle the end of the window, and a red x the ship's current position (latest MET fix, even when the window is in the past). A legend in the corner labels them.
+- **ADCP sections:** u (east) and v (north) vs time and depth over the same window. A dashed box shows the depth range used for averaging.
+- **Underway time series:** SST and TSG temperature, salinity, true wind speed, ship speed.
+- **Readout:** latest time, position (decimal and degrees-minutes), SOG/COG, SST/TSG/salinity, true wind, multibeam depth, depth-averaged current, and how old the latest MET and ADCP data are (red if stale).
+
+Everything re-reads every 60 s. Files are cached by modification time, so a refresh only re-reads the files that changed.
+
+## Running it
+
+One-time setup:
+
+```
+cd ~/Dropbox/SIO/projects/muri/situational_awareness
+conda env create -f environment.yml
+```
+
+Mount the cruise share in Finder (Go > Connect to Server, `smb://rr-sci-filesvr.ucsd.edu/cruise`). It should then appear at `/Volumes/cruise/RR2609`.
+
+Start the dashboard:
+
+```
+conda activate muri-sea
+cd ~/Dropbox/SIO/projects/muri
+bokeh serve --show situational_awareness
+```
+
+This opens http://localhost:5006/situational_awareness. Leave the terminal running. To let others on the ship network view it, add `--allow-websocket-origin=<your-ip>:5006` and share `http://<your-ip>:5006/situational_awareness`.
+
+### Controls
+
+- **Start / End:** sliders that set the time window shown everywhere (map, ADCP sections, time series). They span all available data, and the chosen times are printed in the slider titles, with the window length below. The window is limited to 15 min - 72 h (`WINDOW_MIN_H`, `WINDOW_MAX_H` in `config.py`). If you drag one slider past those limits, the other one moves with it. The down/up arrow buttons next to each slider move that end of the window by 15 min (`NUDGE_MIN`).
+- **Color track by:** the variable used to color the track.
+- **ADCP depth range:** the depth range used for the depth-averaged vectors, the "ADCP speed" track color, and the readout current.
+- **Vectors:** none, shallowest good bin, or depth range average.
+- **Follow latest:** keeps End at the newest data, with the same window length, as new data arrive. Moving End back in time (slider or button) turns this off, and moving it all the way to the latest data turns it back on.
+- **Auto-zoom map:** uncheck to pan and zoom the map yourself without it resetting at every refresh.
+
+## Files
+
+- `main.py` - Bokeh server app (layout, widgets, update loop)
+- `readers.py` - readers for MetAcq, UHDAS ADCP and bathymetry (no Bokeh, can be used on their own)
+- `config.py` - paths, sonar, refresh rate, defaults. **Edit this for a new cruise or sonar.**
+- `environment.yml` - conda environment `muri-sea`
+
+## Data sources
+
+All shipboard data come from the cruise share **`smb://rr-sci-filesvr.ucsd.edu/cruise/RR2609`**, mounted locally at **`/Volumes/cruise/RR2609`**. The share's overview of the instruments is in `/Volumes/cruise/RR2609/RR2609_README.txt`.
+
+### MetAcq underway system (navigation, met, TSG, SST)
+
+- **Data:** `/Volumes/cruise/RR2609/metacq/data/YYMMDD.MET` (one file per UTC day, e.g. `/Volumes/cruise/RR2609/metacq/data/261011.MET`)
+- **Acquisition config** (sensors and modules): `/Volumes/cruise/RR2609/metacq/settings/RR26G.acq`
+- **Manual** (parameter definitions are in Appendix A): `/Volumes/cruise/RR2609/metacq/docs/MetAcq.pdf`
+- **Format:** "Met Data - Corrected". There are 3 `#` header lines, then a `#Time ...` line with column names, then whitespace-delimited rows every 15 s. Missing values are `-99`. The file on the share is updated about every 5 min.
+- **Time:** taken from `ZD` (GPS time, seconds since 1970-01-01 UTC). If `ZD` is bad, it falls back to the file date plus `Time` (HHMMSS UTC).
+- **Columns used:**
+
+| Column | Meaning (MetAcq manual, Appendix A) | Units | Sensor on RR2609 |
+|---|---|---|---|
+| `LA`, `LO` | Latitude, longitude | decimal deg | Seapath GPS |
+| `CR`, `SP` | Course and speed over ground | deg, knots | GPS |
+| `ST` | Sea surface temperature | °C | SBE38, bow thruster UCW intake |
+| `TT`, `SA` | TSG temperature, salinity | °C, psu | SBE45 |
+| `FL` | Fluorometer | µg/l | |
+| `TW`, `TI` | True wind speed, direction (coming from) | m/s, deg | |
+| `MB` | Multibeam depth | m | |
+
+### Shipboard ADCP (UHDAS)
+
+- **Data:** `/Volumes/cruise/RR2609/adcp_uhdas/RR2609/proc/os150nb/contour/os150nb.nc`
+- **Alternative sonar:** `/Volumes/cruise/RR2609/adcp_uhdas/RR2609/proc/os75nb/contour/os75nb.nc`. The os75 is out of commission on RR2609 according to the cruise README. Change `SONAR` in `config.py` to switch.
+- **UHDAS settings:** `/Volumes/cruise/RR2609/adcp_uhdas/settings/`
+- **Processing status:** `/Volumes/cruise/RR2609/adcp_uhdas/RR2609/proc/os150nb/cruise_info.txt`
+- **Format:** UHDAS/CODAS "contour" netCDF with 3-min ensembles and 50 bins of 8 m from 22 to 414 m. It is updated by the shipboard processing about every 15-20 min.
+- **Variables used:**
+  - `time` (days since 2026-01-01)
+  - `lon`, `lat`
+  - `depth` (depth_cell x time)
+  - `u`, `v` (absolute velocity, m/s)
+  - `pflag` (bins with `pflag != 0` are set to NaN)
+- **Caveat:** these are at-sea products. The calibration, heading correction and editing steps listed in `cruise_info.txt` have not been done, so treat velocities as preliminary.
+
+### Bathymetry
+
+- **Data:** `/Users/ncouto/Dropbox/SIO/projects/muri/Planning/bathy/muri_bathy.nc`
+- **Contents:** variables `lat`, `lon`, `z` (m, negative is ocean), covering 34.8-37 N, 124-121 W. It is plotted at every 2nd point (`BATHY_STRIDE`). Isobaths are 100, 200, 500, 1000, 2000, 3000 and 4000 m, and the z = 0 contour serves as the coastline.
+- **Caveat:** outside this box (e.g. north of 37 N toward San Francisco) the track is drawn on a blank background.
