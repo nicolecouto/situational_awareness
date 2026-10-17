@@ -17,12 +17,14 @@ sys.path.insert(0, str(Path(__file__).parent))
 import cmocean
 import numpy as np
 import pandas as pd
+from bokeh.events import DoubleTap, Tap
 from bokeh.io import curdoc
 from bokeh.layouts import column, row
 from bokeh.models import (Arrow, BoxAnnotation, Button, Checkbox, ColorBar,
                           ColumnDataSource, DatetimeTickFormatter, Div,
                           HoverTool, Label, LinearColorMapper, RadioButtonGroup,
-                          Range1d, RangeSlider, Select, Slider, VeeHead)
+                          Range1d, RangeSlider, Select, Slider, Span,
+                          VeeHead)
 from bokeh.plotting import figure
 from matplotlib.colors import to_hex
 
@@ -51,7 +53,12 @@ DATETIME_FMT = DatetimeTickFormatter(hours="%H:%M", minutes="%H:%M",
 MS_PER_H = 3600e3
 # busy: set while the app moves the sliders itself, so their callbacks
 # don't respond to it
-STATE = {"busy": False}
+# zoomed: the map has been fitted to the track once, after which it keeps
+# the user's zoom unless Auto-zoom is on
+# mark_t: time of the marker placed by clicking a plot (or None)
+# met: underway data in the window, for placing the marker
+STATE = {"busy": False, "zoomed": False, "mark_t": None,
+         "met": pd.DataFrame()}
 
 
 def ms2ts(ms):
@@ -119,7 +126,10 @@ vec_mode = RadioButtonGroup(labels=VECTOR_MODES, active=2)
 BASEMAPS = ["Bathymetry", "Satellite SST"]
 basemap = RadioButtonGroup(labels=BASEMAPS, active=0)
 follow = Checkbox(label="Follow latest", active=True)
-autozoom = Checkbox(label="Auto-zoom map", active=True)
+autozoom = Checkbox(label="Auto-zoom map", active=False)
+zoom_btn = Button(label="Zoom to track", width=110)
+MARK_COLOR = "#ff7f00"
+mark_div = Div(text="", width=650)
 status = Div(text="", width=650)
 readout = Div(text="", width=720)
 
@@ -204,6 +214,11 @@ ends_r = map_fig.scatter("lon", "lat", source=ends_src, size=12,
 now_r = map_fig.scatter("lon", "lat", source=now_src, marker="x", size=20,
                         line_color="red", line_width=3,
                         legend_label="Current position")
+# Marker placed by clicking a time series or the map
+mark_src = ColumnDataSource(dict(lon=[], lat=[]))
+map_fig.scatter("lon", "lat", source=mark_src, marker="diamond", size=16,
+                fill_color=MARK_COLOR, line_color="black", line_width=1.5,
+                legend_label="Marker")
 # Drifting mooring beacon fixes in the time window
 beacon_r = map_fig.scatter("lon", "lat", source=beacon_src, size=5,
                            color="red", line_color=None,
@@ -278,6 +293,15 @@ for title, lines in ts_specs:
         formatters={"@t": "datetime"}))
     ts_figs.append(f)
 
+# The marker's time as a vertical line on every time axis
+time_figs = [uv_figs["u"], uv_figs["v"], *ts_figs]
+mark_spans = []
+for f in time_figs:
+    sp = Span(location=0, dimension="height", line_color=MARK_COLOR,
+              line_width=2, line_dash="dashed", visible=False)
+    f.add_layout(sp)
+    mark_spans.append(sp)
+
 
 # ---------------------------------------------------------------- helpers
 def robust_limits(x, lo=2, hi=98):
@@ -292,11 +316,12 @@ def robust_limits(x, lo=2, hi=98):
 
 
 def set_map_ranges(lon, lat):
-    """Zoom the map to the track with a cos(lat)-correct aspect ratio."""
+    """Zoom the map to the track with a cos(lat)-correct aspect ratio.
+    Returns False if there was nothing to zoom to."""
     lon, lat = np.asarray(lon), np.asarray(lat)
     ok = np.isfinite(lon) & np.isfinite(lat)
     if not ok.any():
-        return
+        return False
     lon, lat = lon[ok], lat[ok]
     clat = 0.5 * (lat.min() + lat.max())
     clon = 0.5 * (lon.min() + lon.max())
@@ -305,6 +330,63 @@ def set_map_ranges(lon, lat):
     half_x = half_y / coslat * map_fig.frame_width / map_fig.frame_height
     map_fig.x_range.update(start=clon - half_x, end=clon + half_x)
     map_fig.y_range.update(start=clat - half_y, end=clat + half_y)
+    return True
+
+
+# ---------------------------------------------------------------- marker
+def draw_mark():
+    """Show the marker at STATE["mark_t"]: a line on the time axes and a
+    diamond on the map at the nearest underway fix. Hidden if it is
+    unset or outside the time window."""
+    t, met = STATE["mark_t"], STATE["met"]
+    pos = (met[["lon", "lat"]].dropna() if {"lon", "lat"} <= set(met)
+           else pd.DataFrame())
+    if t is None or not len(pos) or not pos.index[0] <= t <= pos.index[-1]:
+        mark_src.data = dict(lon=[], lat=[])
+        for sp in mark_spans:
+            sp.visible = False
+        mark_div.text = ("<i>Click a time series or the ship track to place "
+                         "a marker; double-click to clear.</i>")
+        return
+    i = pos.index.get_indexer([t], method="nearest")[0]
+    t = pos.index[i]
+    lon, lat = pos["lon"].iloc[i], pos["lat"].iloc[i]
+    mark_src.data = dict(lon=[lon], lat=[lat])
+    for sp in mark_spans:
+        sp.update(location=ts2ms(t), visible=True)
+    g = met.loc[t].get
+    vals = " &nbsp; ".join(
+        f"{lab} {g(c):{fmt}}" for c, lab, fmt in
+        [("sst", "SST", ".3f"), ("sal", "S", ".3f"), ("sog", "SOG", ".1f")]
+        if c in met and np.isfinite(g(c)))
+    mark_div.text = (f"<span style='color:{MARK_COLOR}'>&#9670;</span> "
+                     f"<b>Marker</b> {t:%m/%d %H:%M:%S} UTC &nbsp; "
+                     f"{ddm(lat, 'N', 'S')}, {ddm(lon180(lon), 'E', 'W')} "
+                     f"&nbsp; {vals} &nbsp; <i>(double-click to clear)</i>")
+
+
+def on_time_tap(event):
+    STATE["mark_t"] = ms2ts(event.x)
+    draw_mark()
+
+
+def on_map_tap(event):
+    """Put the marker at the time of the track point nearest the click."""
+    met = STATE["met"]
+    if not {"lon", "lat"} <= set(met):
+        return
+    pos = met[["lon", "lat"]].dropna()
+    if not len(pos):
+        return
+    coslat = np.cos(np.radians(event.y))
+    d2 = ((pos["lon"] - event.x) * coslat) ** 2 + (pos["lat"] - event.y) ** 2
+    STATE["mark_t"] = d2.idxmin()
+    draw_mark()
+
+
+def clear_mark(event):
+    STATE["mark_t"] = None
+    draw_mark()
 
 
 def ddm(x, pos, neg):
@@ -482,6 +564,7 @@ def update():
         met = read_met(t0, t1)
     except Exception as e:
         warnings.append(f"MET: {e}")
+    STATE["met"] = met
     if len(met):
         line_src.data = dict(lon=met["lon"].values, lat=met["lat"].values)
         ts_src.data = {"t": met.index.values,
@@ -583,12 +666,13 @@ def update():
                         if src_kind == "met" else
                         f"ADCP speed {zmin:.0f}-{zmax:.0f} m ({units})")
 
-    # --- map extent
-    if autozoom.active:
-        set_map_ranges(np.r_[line_src.data["lon"], tr["lon"],
-                             beacon_src.data["lon"]],
-                       np.r_[line_src.data["lat"], tr["lat"],
-                             beacon_src.data["lat"]])
+    # --- map extent: fit to the track once (or on Zoom to track), then
+    # keep the user's zoom unless Auto-zoom is on
+    if autozoom.active or not STATE["zoomed"]:
+        STATE["zoomed"] = set_map_ranges(
+            np.r_[line_src.data["lon"], tr["lon"], beacon_src.data["lon"]],
+            np.r_[line_src.data["lat"], tr["lat"], beacon_src.data["lat"]])
+    draw_mark()
 
     # --- ADCP vectors
     mode = VECTOR_MODES[vec_mode.active]
@@ -706,6 +790,17 @@ def on_nudge(side, sign):
     return cb
 
 
+def on_zoom():
+    STATE["zoomed"] = False
+    update()
+
+
+zoom_btn.on_click(on_zoom)
+map_fig.on_event(Tap, on_map_tap)
+for f in time_figs:
+    f.on_event(Tap, on_time_tap)
+for f in [map_fig, *time_figs]:
+    f.on_event(DoubleTap, clear_mark)
 for (side, sign), btn in nudge_btns.items():
     btn.on_click(on_nudge(side, sign))
 start_slide.on_change("value", on_drag("start"))
@@ -723,9 +818,10 @@ controls = column(
     row(start_slide, nudge_group("start")),
     row(end_slide, nudge_group("end")),
     zrange,
-    row(window_div, follow, autozoom),
+    row(window_div, follow, autozoom, zoom_btn),
     row(color_select, column(Div(text="&nbsp;", height=12), vec_mode)),
     row(Div(text="Map background:", styles={"margin-top": "6px"}), basemap),
+    mark_div,
 )
 layout = row(column(controls, map_fig),
              column(readout, uv_figs["u"], uv_figs["v"], *ts_figs))

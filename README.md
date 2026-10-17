@@ -39,7 +39,8 @@ This opens http://localhost:5006/situational_awareness. Leave the terminal runni
 - **ADCP depth range:** the depth range used for the depth-averaged vectors, the "ADCP speed" track color, and the readout current.
 - **Vectors:** none, shallowest good bin, or depth range average.
 - **Follow latest:** keeps End at the newest data, with the same window length, as new data arrive. Moving End back in time (slider or button) turns this off, and moving it all the way to the latest data turns it back on.
-- **Auto-zoom map:** uncheck to pan and zoom the map yourself without it resetting at every refresh.
+- **Map zoom:** the map fits the track when the page opens, then keeps whatever pan and zoom you set. **Zoom to track** refits it once. **Auto-zoom map** (off by default) refits it at every refresh.
+- **Marker:** click a time series or ADCP section to put an orange dashed line at that time on all of them, and an orange diamond on the map at the ship's position then. Or click the ship track on the map to mark the nearest fix. The marker snaps to the nearest underway fix, the line under the controls gives its time, position, SST, salinity and SOG, and double-clicking any plot clears it. It stays through refreshes while its time is in the window.
 - **Map background:** bathymetry, or the latest daily satellite SST field (see Data sources). Track dots get a black outline on SST so they stand out.
 
 ## Setting up a new cruise
