@@ -4,7 +4,7 @@ Run from the parent directory with:
     conda activate muri-sea
     bokeh serve --show situational_awareness
 
-Shows ship track over bathymetry (colored by an underway or ADCP variable,
+Shows ship track over bathymetry or satellite SST (colored by an underway or ADCP variable,
 with optional ADCP current vectors), ADCP u/v sections, underway time
 series, and a current-conditions readout. Data are re-read every
 config.REFRESH_S seconds.
@@ -38,11 +38,11 @@ def cmo_palette(name, n=256):
 
 # Track color choices: label -> (source, column, units, palette)
 COLOR_VARS = {
-    "SST (SBE38)":          ("met", "ST", "°C", cmo_palette("thermal")),
-    "TSG temperature":      ("met", "TT", "°C", cmo_palette("thermal")),
-    "Salinity":             ("met", "SA", "psu", cmo_palette("haline")),
-    "Fluorescence":         ("met", "FL", "µg/l", cmo_palette("algae")),
-    "Ship speed (SOG)":     ("met", "SP", "kn", cmo_palette("speed")),
+    "SST (underway)":       ("met", "sst", "°C", cmo_palette("thermal")),
+    "TSG temperature":      ("met", "tsg_t", "°C", cmo_palette("thermal")),
+    "Salinity":             ("met", "sal", "psu", cmo_palette("haline")),
+    "Fluorescence":         ("met", "fluor", "µg/l", cmo_palette("algae")),
+    "Ship speed (SOG)":     ("met", "sog", "kn", cmo_palette("speed")),
     "ADCP speed (z range)": ("adcp", None, "m/s", cmo_palette("speed")),
 }
 VECTOR_MODES = ["No vectors", "Shallowest bin", "Depth range"]
@@ -60,6 +60,29 @@ def ms2ts(ms):
 
 def ts2ms(t):
     return pd.Timestamp(t).value / 1e6
+
+
+def wrap_lon(lon):
+    """Longitudes in the map's convention: 0-360 if cfg.LON_0_360 (cruises
+    across 180°), else -180 to 180."""
+    lon = np.asarray(lon, float)
+    return lon % 360 if cfg.LON_0_360 else (lon + 180) % 360 - 180
+
+
+def lon180(lon):
+    """Longitude in -180 to 180, for printing."""
+    return (lon + 180) % 360 - 180
+
+
+MET_KW = dict(pattern=cfg.MET_FILE, missing=cfg.MET_MISSING,
+              columns=cfg.MET_COLUMNS)
+
+
+def read_met(t0, t1):
+    met = readers.read_met(cfg.MET_DIR, t0, t1, **MET_KW)
+    if "lon" in met:
+        met = met.assign(lon=wrap_lon(met["lon"]))
+    return met
 
 
 # ----------------------------------------------------------------- widgets
@@ -93,34 +116,59 @@ zrange = RangeSlider(title="ADCP depth range (m)", start=0,
                      end=cfg.ADCP_ZMAX_PLOT, step=5, value=cfg.ADCP_ZRANGE,
                      width=SLIDER_W)
 vec_mode = RadioButtonGroup(labels=VECTOR_MODES, active=2)
+BASEMAPS = ["Bathymetry", "Satellite SST"]
+basemap = RadioButtonGroup(labels=BASEMAPS, active=0)
 follow = Checkbox(label="Follow latest", active=True)
 autozoom = Checkbox(label="Auto-zoom map", active=True)
 status = Div(text="", width=650)
 readout = Div(text="", width=720)
 
 # ------------------------------------------------------------------ map
-bathy_lon, bathy_lat, bathy_z = readers.load_bathy(cfg.BATHY_FILE,
-                                                   cfg.BATHY_STRIDE)
-lat0 = float(np.nanmean(bathy_lat))
-bz = np.where(bathy_z < 0, bathy_z, np.nan).astype(float)
+if cfg.BATHY_FILE is not None:
+    bathy_lon, bathy_lat, bathy_z = readers.load_bathy(cfg.BATHY_FILE,
+                                                       cfg.BATHY_STRIDE)
+    bathy_lon = wrap_lon(bathy_lon)
+    order = np.argsort(bathy_lon)
+    bathy_lon, bathy_z = bathy_lon[order], bathy_z[:, order]
+    bz = np.where(bathy_z < 0, bathy_z, np.nan).astype(float)
+    xr0, yr0 = (bathy_lon.min(), bathy_lon.max()), (bathy_lat.min(),
+                                                     bathy_lat.max())
+else:  # auto-zoom finds the ship at the first refresh
+    xr0, yr0 = (-180, 180), (-90, 90)
 
 map_fig = figure(frame_width=650, frame_height=650,
-                 x_range=Range1d(bathy_lon.min(), bathy_lon.max()),
-                 y_range=Range1d(bathy_lat.min(), bathy_lat.max()),
+                 x_range=Range1d(*xr0), y_range=Range1d(*yr0),
                  tools="pan,wheel_zoom,box_zoom,reset,save",
                  active_scroll="wheel_zoom", x_axis_label="Longitude",
                  y_axis_label="Latitude", title="Ship track")
 bathy_mapper = LinearColorMapper(palette=cmo_palette("deep"), low=-4500,
                                  high=0, nan_color="#e6dcc3")
 bathy_mapper.palette = bathy_mapper.palette[::-1][40:]  # light shallow end
-bathy_r = map_fig.image(image=[bz], x=bathy_lon.min(), y=bathy_lat.min(),
-                        dw=np.ptp(bathy_lon), dh=np.ptp(bathy_lat),
-                        color_mapper=bathy_mapper, alpha=0.75)
-map_fig.contour(bathy_lon, bathy_lat, np.nan_to_num(bathy_z, nan=1),
-                levels=sorted(cfg.ISOBATHS), line_color="#5a6e80", line_alpha=0.5,
-                line_width=0.7)
-map_fig.contour(bathy_lon, bathy_lat, np.nan_to_num(bathy_z, nan=1),
-                levels=[0], line_color="black", line_width=1.2)
+bathy_src = ColumnDataSource(dict(image=[], x=[], y=[], dw=[], dh=[]))
+if cfg.BATHY_FILE is not None:
+    bathy_src.data = dict(image=[bz], x=[bathy_lon.min()],
+                          y=[bathy_lat.min()], dw=[np.ptp(bathy_lon)],
+                          dh=[np.ptp(bathy_lat)])
+bathy_r = map_fig.image("image", x="x", y="y", dw="dw", dh="dh",
+                        source=bathy_src, color_mapper=bathy_mapper,
+                        alpha=0.75)
+# Satellite SST basemap, shown instead of the bathymetry when picked
+sst_mapper = LinearColorMapper(palette=cmo_palette("thermal"), low=10,
+                               high=20, nan_color="#e6dcc3")
+sst_src = ColumnDataSource(dict(image=[], x=[], y=[], dw=[], dh=[]))
+sst_r = map_fig.image("image", x="x", y="y", dw="dw", dh="dh",
+                      source=sst_src, color_mapper=sst_mapper, visible=False)
+sst_cbar = ColorBar(color_mapper=sst_mapper, orientation="horizontal",
+                    height=10, title="Satellite SST (°C)", visible=False)
+map_fig.add_layout(sst_cbar, "below")
+map_fig.add_tools(HoverTool(renderers=[sst_r],
+                            tooltips=[("satellite SST", "@image{0.00} °C")]))
+if cfg.BATHY_FILE is not None:
+    map_fig.contour(bathy_lon, bathy_lat, np.nan_to_num(bathy_z, nan=1),
+                    levels=sorted(cfg.ISOBATHS), line_color="#5a6e80",
+                    line_alpha=0.5, line_width=0.7)
+    map_fig.contour(bathy_lon, bathy_lat, np.nan_to_num(bathy_z, nan=1),
+                    levels=[0], line_color="black", line_width=1.2)
 map_fig.add_tools(HoverTool(renderers=[bathy_r],
                             tooltips=[("depth", "@image{0} m")]))
 
@@ -129,6 +177,7 @@ line_src = ColumnDataSource(dict(lon=[], lat=[]))
 track_src = ColumnDataSource(dict(lon=[], lat=[], t=[], val=[]))
 ends_src = ColumnDataSource(dict(lon=[], lat=[], t=[], color=[], label=[]))
 now_src = ColumnDataSource(dict(lon=[], lat=[], t=[], label=[]))
+beacon_src = ColumnDataSource(dict(lon=[], lat=[], t=[]))
 vec_src = ColumnDataSource(dict(x0=[], y0=[], x1=[], y1=[]))
 vscale_src = ColumnDataSource(dict(x0=[], y0=[], x1=[], y1=[]))
 
@@ -155,12 +204,19 @@ ends_r = map_fig.scatter("lon", "lat", source=ends_src, size=12,
 now_r = map_fig.scatter("lon", "lat", source=now_src, marker="x", size=20,
                         line_color="red", line_width=3,
                         legend_label="Current position")
+# Drifting mooring beacon fixes in the time window
+beacon_r = map_fig.scatter("lon", "lat", source=beacon_src, size=5,
+                           color="red", line_color=None,
+                           legend_label=f"Beacon {cfg.BEACON_NAME}")
 map_fig.legend.location = "top_right"
 map_fig.legend.label_text_font_size = "10px"
 map_fig.legend.padding = 3
 map_fig.legend.background_fill_alpha = 0.7
 map_fig.add_tools(HoverTool(renderers=[ends_r, now_r], tooltips=[
     ("", "@label"), ("time", "@t{%m/%d %H:%M}"),
+    ("pos", "@lat{0.0000}, @lon{0.0000}")], formatters={"@t": "datetime"}))
+map_fig.add_tools(HoverTool(renderers=[beacon_r], tooltips=[
+    ("", f"Beacon {cfg.BEACON_NAME}"), ("time", "@t{%m/%d %H:%M}"),
     ("pos", "@lat{0.0000}, @lon{0.0000}")], formatters={"@t": "datetime"}))
 map_fig.add_tools(HoverTool(renderers=[track_r], tooltips=[
     ("time", "@t{%m/%d %H:%M}"), ("value", "@val{0.000}"),
@@ -198,10 +254,10 @@ for comp in ("u", "v"):
 ts_src = ColumnDataSource(dict(t=[], ST=[], TT=[], SA=[], TW=[], TI=[],
                                SP=[]))
 ts_specs = [  # (title, [(column, color, legend)])
-    ("Temperature (°C)", [("ST", "#c0392b", "SST"), ("TT", "#2c7fb8", "TSG")]),
-    ("Salinity (psu)", [("SA", "#1b9e77", None)]),
-    ("True wind (m/s)", [("TW", "#555555", None)]),
-    ("Ship speed (kn)", [("SP", "#7570b3", None)]),
+    ("Temperature (°C)", [("sst", "#c0392b", "SST"), ("tsg_t", "#2c7fb8", "TSG")]),
+    ("Salinity (psu)", [("sal", "#1b9e77", None)]),
+    ("True wind (m/s)", [("wind", "#555555", None)]),
+    ("Ship speed (kn)", [("sog", "#7570b3", None)]),
 ]
 ts_figs = []
 for title, lines in ts_specs:
@@ -284,6 +340,65 @@ def age_html(label, t_last, now, stale_min):
             f"({age:.0f} min old)</span>")
 
 
+def sst_box(ship):
+    """SST download box: cfg.SST_BOX, or SST_HALF_DEG of latitude around
+    ship (lon, lat) with the same distance in longitude."""
+    if cfg.SST_BOX is not None or ship is None:
+        return cfg.SST_BOX
+    lon, lat = ship
+    h = cfg.SST_HALF_DEG
+    hx = min(h / max(np.cos(np.radians(lat)), 0.1), 179)
+    return (max(lat - h, -89.9), min(lat + h, 89.9), lon - hx, lon + hx)
+
+
+def ship_near_edge(lon, lat, ship):
+    """True if ship (lon, lat) is outside the middle half of the grid."""
+    if ship is None:
+        return False
+    x, y = wrap_lon(ship[0]), ship[1]
+    lon = wrap_lon(lon)
+    qx, qy = 0.25 * np.ptp(lon), 0.25 * np.ptp(lat)
+    return not (lon.min() + qx <= x <= lon.max() - qx
+                and lat.min() + qy <= y <= lat.max() - qy)
+
+
+def refresh_sst(now, ship, warnings):
+    """Show the satellite SST field, downloading a new one if the local
+    copy is older than SST_REFRESH_H or (box following the ship) the ship
+    is near its edge, at most every SST_RETRY_MIN after a failure. ship is
+    (lon, lat) or None. Returns the analysis time, or None if no field."""
+    f = cfg.SST_FILE
+    age_h = ((now.timestamp() - f.stat().st_mtime) / 3600 if f.exists()
+             else np.inf)
+    stale = age_h > cfg.SST_REFRESH_H
+    if not stale and cfg.SST_BOX is None:
+        lon, lat, _, _ = readers.read_sst(f)
+        stale = ship_near_edge(lon, lat, ship)
+    box = sst_box(ship)
+    last_try = STATE.get("sst_try")
+    if stale and box is not None and (
+            last_try is None
+            or now - last_try > pd.Timedelta(minutes=cfg.SST_RETRY_MIN)):
+        STATE["sst_try"] = now
+        try:
+            readers.download_sst(cfg.SST_ERDDAP, box, f)
+        except Exception as e:
+            warnings.append(f"SST download: {e}"
+                            + (" (showing older copy)" if f.exists() else ""))
+    if not f.exists():
+        return None
+    lon, lat, sst, t_sst = readers.read_sst(f)
+    lon = wrap_lon(lon)
+    order = np.argsort(lon)
+    lon, sst = lon[order], sst[:, order]
+    dlon, dlat = np.median(np.diff(lon)), np.median(np.diff(lat))
+    sst_src.data = dict(image=[sst], x=[lon[0] - dlon / 2],
+                        y=[lat[0] - dlat / 2], dw=[dlon * lon.size],
+                        dh=[dlat * lat.size])
+    sst_mapper.update(**dict(zip(("low", "high"), robust_limits(sst, 1, 99))))
+    return t_sst
+
+
 # ---------------------------------------------------------- time window
 def set_slider_bounds(t_first, t_last):
     """Let the start/end sliders span the available data."""
@@ -332,17 +447,21 @@ def update():
 
     t_met_first = t_met_last = t_adcp_first = t_adcp_last = None
     try:
-        t_met_first = readers.earliest_met_time(cfg.MET_DIR)
-        t_met_last = readers.latest_met_time(cfg.MET_DIR)
+        t_met_first, t_met_last = readers.met_time_span(cfg.MET_DIR,
+                                                        **MET_KW)
     except Exception as e:
         warnings.append(f"MET: {e}")
-    try:
-        ds_all = readers.read_adcp(cfg.ADCP_FILE)
-        t_adcp_first = pd.Timestamp(ds_all["time"].values[0])
-        t_adcp_last = pd.Timestamp(ds_all["time"].values[-1])
-    except Exception as e:
-        ds_all = None
-        warnings.append(f"ADCP: {e}")
+    ds_all = None
+    if cfg.ADCP_FILE is not None:
+        try:
+            ds_all = readers.read_adcp(cfg.ADCP_FILE)
+            ds_all = ds_all.assign(lon=ds_all["lon"].copy(
+                data=wrap_lon(ds_all["lon"])))
+            t_adcp_first = pd.Timestamp(ds_all["time"].values[0])
+            t_adcp_last = pd.Timestamp(ds_all["time"].values[-1])
+        except Exception as e:
+            ds_all = None
+            warnings.append(f"ADCP: {e}")
 
     # --- time window from the start/end sliders
     firsts = [t for t in (t_met_first, t_adcp_first) if t is not None]
@@ -360,18 +479,18 @@ def update():
     # --- underway
     met = pd.DataFrame()
     try:
-        met = readers.read_met(cfg.MET_DIR, t0, t1)
+        met = read_met(t0, t1)
     except Exception as e:
         warnings.append(f"MET: {e}")
     if len(met):
-        line_src.data = dict(lon=met["LO"].values, lat=met["LA"].values)
+        line_src.data = dict(lon=met["lon"].values, lat=met["lat"].values)
         ts_src.data = {"t": met.index.values,
                        **{c: met[c].values if c in met else
                           np.full(len(met), np.nan)
-                          for c in ("ST", "TT", "SA", "TW", "TI", "SP")}}
-        pos = met[["LO", "LA"]].dropna()
+                          for c in ("sst", "tsg_t", "sal", "wind", "wind_dir", "sog")}}
+        pos = met[["lon", "lat"]].dropna()
         ends = pos.iloc[[0, -1]] if len(pos) else pos
-        ends_src.data = dict(lon=ends["LO"].values, lat=ends["LA"].values,
+        ends_src.data = dict(lon=ends["lon"].values, lat=ends["lat"].values,
                              t=ends.index.values,
                              color=["#2c7fb8", "#c0392b"][:len(ends)],
                              label=["Window start", "Window end"][:len(ends)])
@@ -382,17 +501,47 @@ def update():
     now_src.data = dict(lon=[], lat=[], t=[], label=[])
     if t_met_last is not None:
         try:
-            pos = readers.read_met(cfg.MET_DIR,
-                                   t_met_last - pd.Timedelta(minutes=10),
-                                   t_met_last)[["LO", "LA"]].dropna()
+            pos = read_met(t_met_last - pd.Timedelta(minutes=10),
+                           t_met_last)[["lon", "lat"]].dropna()
             if len(pos):
-                now_src.data = dict(lon=pos["LO"].values[-1:],
-                                    lat=pos["LA"].values[-1:],
+                now_src.data = dict(lon=pos["lon"].values[-1:],
+                                    lat=pos["lat"].values[-1:],
                                     t=pos.index.values[-1:],
                                     label=["Current position"])
         except Exception as e:
             warnings.append(f"MET: {e}")
     time_range.update(start=t0, end=t1)
+
+    # --- basemap
+    show_sst = BASEMAPS[basemap.active] == "Satellite SST"
+    t_sst = None
+    if show_sst:
+        try:
+            ship = (tuple(np.r_[now_src.data["lon"], now_src.data["lat"]])
+                    if len(now_src.data["lon"]) else None)
+            t_sst = refresh_sst(now, ship, warnings)
+        except Exception as e:
+            warnings.append(f"SST: {e}")
+    bathy_r.visible = not show_sst
+    sst_r.visible = sst_cbar.visible = show_sst
+    # outline the track dots so they stand out on the SST colors
+    track_r.glyph.line_color = "black" if show_sst else None
+    map_fig.title.text = ("Ship track" if not show_sst else
+                          f"Ship track on {cfg.SST_NAME}, "
+                          + (f"{t_sst:%Y-%m-%d}" if t_sst is not None
+                             else "not available"))
+
+    # --- mooring beacon
+    beacon = pd.DataFrame()
+    try:
+        beacon = readers.read_beacon(cfg.BEACON_DIR, t0=cfg.BEACON_START)
+    except Exception as e:
+        warnings.append(f"Beacon: {e}")
+    t_beacon = beacon.index[-1] if len(beacon) else None
+    bwin = beacon.loc[t0:t1] if len(beacon) else beacon
+    beacon_src.data = dict(lon=wrap_lon(bwin["lon"]) if len(bwin) else [],
+                           lat=bwin["lat"].values if len(bwin) else [],
+                           t=bwin.index.values if len(bwin) else [])
 
     # --- ADCP
     ds = None
@@ -420,7 +569,7 @@ def update():
     # --- track color
     src_kind, col, units, palette = COLOR_VARS[color_select.value]
     if src_kind == "met" and len(met) and col in met:
-        tr = dict(lon=met["LO"].values, lat=met["LA"].values,
+        tr = dict(lon=met["lon"].values, lat=met["lat"].values,
                   t=met.index.values, val=met[col].values)
     elif src_kind == "adcp" and ds is not None:
         tr = dict(lon=ds["lon"].values, lat=ds["lat"].values,
@@ -436,8 +585,10 @@ def update():
 
     # --- map extent
     if autozoom.active:
-        set_map_ranges(np.r_[line_src.data["lon"], tr["lon"]],
-                       np.r_[line_src.data["lat"], tr["lat"]])
+        set_map_ranges(np.r_[line_src.data["lon"], tr["lon"],
+                             beacon_src.data["lon"]],
+                       np.r_[line_src.data["lat"], tr["lat"],
+                             beacon_src.data["lat"]])
 
     # --- ADCP vectors
     mode = VECTOR_MODES[vec_mode.active]
@@ -452,7 +603,7 @@ def update():
         df = df.groupby(np.arange(len(df)) // step).mean().dropna()
         yspan = map_fig.y_range.end - map_fig.y_range.start
         s = 0.15 * yspan  # degrees of latitude per 1 m/s
-        coslat = np.cos(np.radians(df["lat"].mean() if len(df) else lat0))
+        coslat = np.cos(np.radians(df["lat"].mean() if len(df) else 0))
         vec_src.data = dict(x0=df["lon"].values, y0=df["lat"].values,
                             x1=(df["lon"] + df["u"] * s / coslat).values,
                             y1=(df["lat"] + df["v"] * s).values)
@@ -471,19 +622,21 @@ def update():
     rows = []
     if len(met):
         last = met.iloc[-1]
-        g = last.get
+        def g(k):
+            return last.get(k, np.nan)
         rows += [
             ("Time (UTC)", f"{met.index[-1]:%Y-%m-%d %H:%M:%S}"),
-            ("Position", f"{g('LA'):.5f}, {g('LO'):.5f} &nbsp; "
-                         f"({ddm(g('LA'), 'N', 'S')}, {ddm(g('LO'), 'E', 'W')})"),
-            ("SOG / COG", f"{g('SP'):.1f} kn / {g('CR'):.0f}°"),
-            ("SST / TSG T / S", f"{g('ST'):.3f} °C / {g('TT'):.3f} °C / "
-                                f"{g('SA'):.3f} psu"),
-            ("True wind", f"{g('TW'):.1f} m/s ({g('TW') / KN2MS:.0f} kn) "
-                          f"from {g('TI'):.0f}°"),
+            ("Position", f"{g('lat'):.5f}, {lon180(g('lon')):.5f} &nbsp; "
+                         f"({ddm(g('lat'), 'N', 'S')}, "
+                         f"{ddm(lon180(g('lon')), 'E', 'W')})"),
+            ("SOG / COG", f"{g('sog'):.1f} kn / {g('cog'):.0f}°"),
+            ("SST / TSG T / S", f"{g('sst'):.3f} °C / {g('tsg_t'):.3f} °C / "
+                                f"{g('sal'):.3f} psu"),
+            ("True wind", f"{g('wind'):.1f} m/s ({g('wind') / KN2MS:.0f} kn) "
+                          f"from {g('wind_dir'):.0f}°"),
         ]
-        if "MB" in met and np.isfinite(g("MB")):
-            rows.append(("Water depth (multibeam)", f"{g('MB'):.0f} m"))
+        if np.isfinite(g("depth")):
+            rows.append(("Water depth (multibeam)", f"{g('depth'):.0f} m"))
     if ds is not None and np.isfinite(ubar).any():
         i = np.where(np.isfinite(ubar))[-1][-1]
         spd = np.hypot(ubar[i], vbar[i])
@@ -492,6 +645,11 @@ def update():
                      f"{spd:.2f} m/s ({spd / KN2MS:.1f} kn) toward "
                      f"{toward:.0f}° &nbsp; [u={ubar[i]:+.2f}, "
                      f"v={vbar[i]:+.2f}]"))
+    if len(beacon):
+        b = beacon.iloc[-1]
+        rows.append((f"Beacon {cfg.BEACON_NAME} (latest)",
+                     f"{b['lat']:.5f}, {b['lon']:.5f} &nbsp; "
+                     f"({ddm(b['lat'], 'N', 'S')}, {ddm(b['lon'], 'E', 'W')})"))
     table = "".join(f"<tr><td style='padding-right:12px'><b>{k}</b></td>"
                     f"<td>{v}</td></tr>" for k, v in rows)
     readout.text = (f"<table style='font-size:13px'>{table}</table>"
@@ -499,6 +657,8 @@ def update():
                     f"{age_html('MET', t_met_last, now, cfg.MET_STALE_MIN)}"
                     f" &nbsp;|&nbsp; "
                     f"{age_html('ADCP', t_adcp_last, now, cfg.ADCP_STALE_MIN)}"
+                    f" &nbsp;|&nbsp; "
+                    f"{age_html('Beacon', t_beacon, now, cfg.BEACON_STALE_MIN)}"
                     f"</div>")
 
     msg = (f"<b>{cfg.CRUISE}</b> &nbsp; last refresh {now:%H:%M:%S} UTC "
@@ -554,7 +714,8 @@ start_slide.on_change("value_throttled", on_change)
 end_slide.on_change("value_throttled", on_end_release)
 for w, attr in [(color_select, "value"),
                 (zrange, "value_throttled"), (vec_mode, "active"),
-                (follow, "active"), (autozoom, "active")]:
+                (follow, "active"), (autozoom, "active"),
+                (basemap, "active")]:
     w.on_change(attr, on_change)
 
 controls = column(
@@ -564,6 +725,7 @@ controls = column(
     zrange,
     row(window_div, follow, autozoom),
     row(color_select, column(Div(text="&nbsp;", height=12), vec_mode)),
+    row(Div(text="Map background:", styles={"margin-top": "6px"}), basemap),
 )
 layout = row(column(controls, map_fig),
              column(readout, uv_figs["u"], uv_figs["v"], *ts_figs))

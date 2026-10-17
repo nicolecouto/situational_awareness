@@ -4,7 +4,7 @@
 
 A live browser dashboard to keep open during the cruise. It shows:
 
-- **Map:** the ship track over bathymetry for the chosen time window, colored by SST, TSG temperature, salinity, fluorescence, ship speed, or ADCP current speed. Optional ADCP current vectors (shallowest good bin, or averaged over a chosen depth range). A blue circle marks the start of the window shown, a red circle the end of the window, and a red x the ship's current position (latest MET fix, even when the window is in the past). A legend in the corner labels them.
+- **Map:** the ship track over bathymetry or satellite SST ("Map background" buttons) for the chosen time window, colored by SST, TSG temperature, salinity, fluorescence, ship speed, or ADCP current speed. Optional ADCP current vectors (shallowest good bin, or averaged over a chosen depth range). A blue circle marks the start of the window shown, a red circle the end of the window, and a red x the ship's current position (latest MET fix, even when the window is in the past). A legend in the corner labels them. Small red dots are GPS fixes from the drifting EK80 mooring beacon (Xeos 1374) in the same time window, and the readout gives its latest position and how old that fix is (red if older than 90 min).
 - **ADCP sections:** u (east) and v (north) vs time and depth over the same window. A dashed box shows the depth range used for averaging.
 - **Underway time series:** SST and TSG temperature, salinity, true wind speed, ship speed.
 - **Readout:** latest time, position (decimal and degrees-minutes), SOG/COG, SST/TSG/salinity, true wind, multibeam depth, depth-averaged current, and how old the latest MET and ADCP data are (red if stale).
@@ -40,12 +40,27 @@ This opens http://localhost:5006/situational_awareness. Leave the terminal runni
 - **Vectors:** none, shallowest good bin, or depth range average.
 - **Follow latest:** keeps End at the newest data, with the same window length, as new data arrive. Moving End back in time (slider or button) turns this off, and moving it all the way to the latest data turns it back on.
 - **Auto-zoom map:** uncheck to pan and zoom the map yourself without it resetting at every refresh.
+- **Map background:** bathymetry, or the latest daily satellite SST field (see Data sources). Track dots get a black outline on SST so they stand out.
+
+## Setting up a new cruise
+
+Everything that changes from cruise to cruise is in the **CRUISE SETUP** block at the top of `config.py`:
+
+1. `CRUISE` and `CRUISE_DIR` (where the ship's share is mounted).
+2. Underway data: `MET_DIR`, the daily file name pattern `MET_FILE` (strftime codes, e.g. `%y%m%d.MET`), `MET_MISSING`, and `MET_COLUMNS`, which maps the dashboard's names (`lat`, `lon`, `sst`, `sog`, ...) to the column names in the ship's files. Leave out anything the ship doesn't log.
+3. ADCP: `SONAR` and `ADCP_FILE` (the UHDAS contour netCDF), or `ADCP_FILE = None`.
+4. `BATHY_FILE`, a netCDF subset for the cruise area (or `None`). The usual variable names work (lon/lat/z, x/y/z, GEBCO and IBCSO lon/lat/elevation).
+5. `LON_0_360 = True` if the cruise crosses 180° (e.g. Ross Sea), so all longitudes are drawn as 0-360.
+6. `SST_BOX`: leave as `None` to follow the ship, or give a fixed box.
+7. Beacon settings, or point `BEACON_DIR` at an empty folder.
+
+**Caveat:** the only underway reader so far is for the MetAcq format used on SIO ships (`readers._read_met_file`). It needs a `#Time` header line with whitespace-separated columns and an `HHMMSS` `Time` column. On a ship that logs in another format, add a reader that returns a DataFrame indexed by UTC time, then use it in `readers._met_loader`. The rest of the dashboard only sees the names in `MET_COLUMNS`.
 
 ## Files
 
 - `main.py` - Bokeh server app (layout, widgets, update loop)
-- `readers.py` - readers for MetAcq, UHDAS ADCP and bathymetry (no Bokeh, can be used on their own)
-- `config.py` - paths, sonar, refresh rate, defaults. **Edit this for a new cruise or sonar.**
+- `readers.py` - readers for MetAcq, UHDAS ADCP, beacon CSVs, satellite SST and bathymetry (no Bokeh, can be used on their own)
+- `config.py` - paths, sonar, refresh rate, defaults. **Edit the CRUISE SETUP block for a new cruise.**
 - `environment.yml` - conda environment `muri-sea`
 
 ## Data sources
@@ -86,8 +101,22 @@ All shipboard data come from the cruise share **`smb://rr-sci-filesvr.ucsd.edu/c
   - `pflag` (bins with `pflag != 0` are set to NaN)
 - **Caveat:** these are at-sea products. The calibration, heading correction and editing steps listed in `cruise_info.txt` have not been done, so treat velocities as preliminary.
 
+### Mooring beacon (Xeos 1374)
+
+- **Data:** every `*.csv` in `beacon/` (`BEACON_DIR` in `config.py`). The files are merged and duplicate fixes dropped, so new CSVs relayed on Slack can be dropped in as they arrive (any file name).
+- **Format:** any delimiter. It needs a time column (name starting with `time`, `Timestamp`, or `date`, UTC) and columns starting with `lat` and `lon` (decimal degrees, lon negative = W). Other columns are ignored.
+- Only fixes from `BEACON_START` (2026-10-17 10:00 UTC, when it surfaced) on are plotted, so the Oct 12 deployment startup fixes are left out.
+- `beacon/` is not tracked in git.
+
+### Satellite SST
+
+- **Data:** NOAA Geo-Polar Blended 5 km daily SST analysis (the field behind the OSPO contour charts), global, from CoastWatch ERDDAP dataset `noaacwBLENDEDsstDNDaily` (`SST_ERDDAP` in `config.py`).
+- **Download:** only while the SST background is shown. It fetches the latest day in a box around the ship (`SST_HALF_DEG` of latitude either side) or in `SST_BOX`, saved to `sst/sst_latest.nc`. It downloads again when the copy is older than `SST_REFRESH_H` (3 h) or the ship nears the edge of the box. A box crossing 180° is fetched in two pieces. Each download is roughly 30 KB. If a download fails, the old copy stays up and the next try waits `SST_RETRY_MIN`.
+- **Caveat:** the analysis lags real time by a day or two (the title gives its date). It is a 5 km blend, so it smooths fronts and filaments that single-pass imagery would show.
+- `sst/` is not tracked in git.
+
 ### Bathymetry
 
-- **Data:** `/Users/ncouto/Dropbox/SIO/projects/muri/Planning/bathy/muri_bathy.nc`
+- **Data:** `/Users/ncouto/Dropbox/SIO/projects/muri/Planning/bathy/muri_bathy.nc` (`BATHY_FILE`, optional)
 - **Contents:** variables `lat`, `lon`, `z` (m, negative is ocean), covering 34.8-37 N, 124-121 W. It is plotted at every 2nd point (`BATHY_STRIDE`). Isobaths are 100, 200, 500, 1000, 2000, 3000 and 4000 m, and the z = 0 contour serves as the coastline.
-- **Caveat:** outside this box (e.g. north of 37 N toward San Francisco) the track is drawn on a blank background.
+- **Caveat:** outside this box (e.g. north of 37 N toward San Francisco) the track is drawn on a blank background. Switch to the SST background there.
