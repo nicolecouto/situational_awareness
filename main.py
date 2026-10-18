@@ -21,10 +21,12 @@ from bokeh.events import DoubleTap, Tap
 from bokeh.io import curdoc
 from bokeh.layouts import column, row
 from bokeh.models import (Arrow, BoxAnnotation, Button, Checkbox, ColorBar,
-                          ColumnDataSource, DatetimeTickFormatter, Div,
-                          HoverTool, Label, LinearColorMapper, RadioButtonGroup,
+                          ColumnDataSource, CustomJSHover,
+                          DatetimeTickFormatter, Div,
+                          HoverTool, Label, Legend, LegendItem,
+                          LinearColorMapper, RadioButtonGroup,
                           Range1d, RangeSlider, Select, Slider, Span,
-                          VeeHead)
+                          Toggle, VeeHead)
 from bokeh.plotting import figure
 from matplotlib.colors import to_hex
 
@@ -51,14 +53,30 @@ VECTOR_MODES = ["No vectors", "Shallowest bin", "Depth range"]
 DATETIME_FMT = DatetimeTickFormatter(hours="%H:%M", minutes="%H:%M",
                                      hourmin="%H:%M", days="%m/%d %H:%M")
 MS_PER_H = 3600e3
+# Hover rows for positions: decimal degrees and degrees-minutes, e.g.
+# 35.46794 (35° 28.076' N). Longitudes are shown in -180 to 180.
+_DDM_JS = """
+    const a = Math.abs(v), d = Math.floor(a);
+    const m = ((a - d) * 60).toFixed(3).padStart(6, "0");
+    return v.toFixed(5) + " (" + d + "\u00b0 " + m + "' " + (v >= 0 ? P : N) + ")";
+"""
+LAT_FMT = CustomJSHover(code='const v = value, P = "N", N = "S";' + _DDM_JS)
+LON_FMT = CustomJSHover(code='const v = ((value + 180) % 360 + 360) % 360'
+                        ' - 180, P = "E", N = "W";' + _DDM_JS)
+POS_TOOLTIPS = [("lat", "@lat{ddm}"), ("lon", "@lon{ddm}")]
+HOVER_FMT = {"@t": "datetime", "@lat": LAT_FMT, "@lon": LON_FMT}
+# Same for the cursor position over the map backgrounds
+CURSOR_TOOLTIPS = [("lat", "$y{ddm}"), ("lon", "$x{ddm}")]
+CURSOR_FMT = {"$y": LAT_FMT, "$x": LON_FMT}
 # busy: set while the app moves the sliders itself, so their callbacks
 # don't respond to it
 # zoomed: the map has been fitted to the track once, after which it keeps
 # the user's zoom unless Auto-zoom is on
+# dist: (lon, lat) points clicked with Calculate distance on
 # mark_t: time of the marker placed by clicking a plot (or None)
 # met: underway data in the window, for placing the marker
 STATE = {"busy": False, "zoomed": False, "mark_t": None,
-         "met": pd.DataFrame()}
+         "met": pd.DataFrame(), "dist": []}
 
 
 def ms2ts(ms):
@@ -119,17 +137,22 @@ def nudge_group(side):
 
 color_select = Select(title="Color track by", value=list(COLOR_VARS)[0],
                       options=list(COLOR_VARS), width=190)
+ZPLOT0 = cfg.ADCP_ZMAX_PLOT or 400  # until the ADCP file says how deep
 zrange = RangeSlider(title="ADCP depth range (m)", start=0,
-                     end=cfg.ADCP_ZMAX_PLOT, step=5, value=cfg.ADCP_ZRANGE,
+                     end=ZPLOT0, step=5, value=cfg.ADCP_ZRANGE,
                      width=SLIDER_W)
 vec_mode = RadioButtonGroup(labels=VECTOR_MODES, active=2)
 BASEMAPS = ["Bathymetry", "Satellite SST"]
 basemap = RadioButtonGroup(labels=BASEMAPS, active=0)
+sonar_btn = RadioButtonGroup(labels=cfg.SONARS, active=0)
 follow = Checkbox(label="Follow latest", active=True)
 autozoom = Checkbox(label="Auto-zoom map", active=False)
 zoom_btn = Button(label="Zoom to track", width=110)
 MARK_COLOR = "#ff7f00"
 mark_div = Div(text="", width=650)
+DIST_COLOR = "#6a3d9a"
+dist_btn = Toggle(label="Calculate distance", width=140)
+dist_div = Div(text="", width=500)
 status = Div(text="", width=650)
 readout = Div(text="", width=720)
 
@@ -140,7 +163,9 @@ if cfg.BATHY_FILE is not None:
     bathy_lon = wrap_lon(bathy_lon)
     order = np.argsort(bathy_lon)
     bathy_lon, bathy_z = bathy_lon[order], bathy_z[:, order]
-    bz = np.where(bathy_z < 0, bathy_z, np.nan).astype(float)
+    # land keeps its elevation (drawn in the mapper's high_color) so the
+    # hover can say "land"; NaN would skip the hover formatter
+    bz = bathy_z.astype(float)
     xr0, yr0 = (bathy_lon.min(), bathy_lon.max()), (bathy_lat.min(),
                                                      bathy_lat.max())
 else:  # auto-zoom finds the ship at the first refresh
@@ -152,7 +177,8 @@ map_fig = figure(frame_width=650, frame_height=650,
                  active_scroll="wheel_zoom", x_axis_label="Longitude",
                  y_axis_label="Latitude", title="Ship track")
 bathy_mapper = LinearColorMapper(palette=cmo_palette("deep"), low=-4500,
-                                 high=0, nan_color="#e6dcc3")
+                                 high=0, high_color="#e6dcc3",
+                                 nan_color="#e6dcc3")
 bathy_mapper.palette = bathy_mapper.palette[::-1][40:]  # light shallow end
 bathy_src = ColumnDataSource(dict(image=[], x=[], y=[], dw=[], dh=[]))
 if cfg.BATHY_FILE is not None:
@@ -168,11 +194,10 @@ sst_mapper = LinearColorMapper(palette=cmo_palette("thermal"), low=10,
 sst_src = ColumnDataSource(dict(image=[], x=[], y=[], dw=[], dh=[]))
 sst_r = map_fig.image("image", x="x", y="y", dw="dw", dh="dh",
                       source=sst_src, color_mapper=sst_mapper, visible=False)
-sst_cbar = ColorBar(color_mapper=sst_mapper, orientation="horizontal",
-                    height=10, title="Satellite SST (°C)", visible=False)
-map_fig.add_layout(sst_cbar, "below")
 map_fig.add_tools(HoverTool(renderers=[sst_r],
-                            tooltips=[("satellite SST", "@image{0.00} °C")]))
+                            tooltips=[("satellite SST", "@image{0.00} °C"),
+                                      *CURSOR_TOOLTIPS],
+                            formatters=CURSOR_FMT))
 if cfg.BATHY_FILE is not None:
     map_fig.contour(bathy_lon, bathy_lat, np.nan_to_num(bathy_z, nan=1),
                     levels=sorted(cfg.ISOBATHS), line_color="#5a6e80",
@@ -180,14 +205,18 @@ if cfg.BATHY_FILE is not None:
     map_fig.contour(bathy_lon, bathy_lat, np.nan_to_num(bathy_z, nan=1),
                     levels=[0], line_color="black", line_width=1.2)
 map_fig.add_tools(HoverTool(renderers=[bathy_r],
-                            tooltips=[("depth", "@image{0} m")]))
+                            tooltips=[("depth", "@image{depth}"),
+                                      *CURSOR_TOOLTIPS],
+                            formatters={"@image": CustomJSHover(code=(
+                                'return value >= 0 ? "land" : '
+                                '(-value).toFixed(0) + " m";')),
+                                **CURSOR_FMT}))
 
 track_mapper = LinearColorMapper(palette=COLOR_VARS[color_select.value][3])
 line_src = ColumnDataSource(dict(lon=[], lat=[]))
 track_src = ColumnDataSource(dict(lon=[], lat=[], t=[], val=[]))
 ends_src = ColumnDataSource(dict(lon=[], lat=[], t=[], color=[], label=[]))
 now_src = ColumnDataSource(dict(lon=[], lat=[], t=[], label=[]))
-beacon_src = ColumnDataSource(dict(lon=[], lat=[], t=[]))
 vec_src = ColumnDataSource(dict(x0=[], y0=[], x1=[], y1=[]))
 vscale_src = ColumnDataSource(dict(x0=[], y0=[], x1=[], y1=[]))
 
@@ -214,28 +243,61 @@ ends_r = map_fig.scatter("lon", "lat", source=ends_src, size=12,
 now_r = map_fig.scatter("lon", "lat", source=now_src, marker="x", size=20,
                         line_color="red", line_width=3,
                         legend_label="Current position")
+# Two points clicked with Calculate distance on, and the line between them
+dist_src = ColumnDataSource(dict(lon=[], lat=[]))
+map_fig.line("lon", "lat", source=dist_src, color=DIST_COLOR, line_width=2,
+             line_dash="dashed")
+map_fig.scatter("lon", "lat", source=dist_src, marker="circle_cross",
+                size=12, fill_alpha=0, line_color=DIST_COLOR, line_width=2)
 # Marker placed by clicking a time series or the map
 mark_src = ColumnDataSource(dict(lon=[], lat=[]))
 map_fig.scatter("lon", "lat", source=mark_src, marker="diamond", size=16,
                 fill_color=MARK_COLOR, line_color="black", line_width=1.5,
                 legend_label="Marker")
-# Drifting mooring beacon fixes in the time window
-beacon_r = map_fig.scatter("lon", "lat", source=beacon_src, size=5,
-                           color="red", line_color=None,
-                           legend_label=f"Beacon {cfg.BEACON_NAME}")
+# Tracked items and stations go in a legend below the map, the window
+# start/end, current position and marker in the one on the map
+below_items = []
+# Fixes of each cfg.TRACKED item (moorings, drifters, ...) in the window
+tracked_srcs = []
+for item in cfg.TRACKED:
+    src = ColumnDataSource(dict(lon=[], lat=[], t=[]))
+    r = map_fig.scatter("lon", "lat", source=src, size=5,
+                        marker=item.get("marker", "circle"),
+                        color=item.get("color", "red"), line_color=None)
+    below_items.append(LegendItem(label=item["name"], renderers=[r]))
+    map_fig.add_tools(HoverTool(renderers=[r], tooltips=[
+        ("", item["name"]), ("time", "@t{%m/%d %H:%M:%S}"),
+        *POS_TOOLTIPS], formatters=HOVER_FMT))
+    tracked_srcs.append(src)
+# Fixed positions from cfg.STATIONS (moorings, stations, ...)
+if cfg.STATIONS:
+    st = cfg.STATIONS
+    stations_src = ColumnDataSource(dict(
+        name=[s["name"] for s in st], lat=[s["lat"] for s in st],
+        lon=list(wrap_lon([s["lon"] for s in st])),
+        marker=[s.get("marker", "square") for s in st],
+        color=[s.get("color", "black") for s in st]))
+    stations_r = map_fig.scatter("lon", "lat", source=stations_src, size=13,
+                                 marker="marker", fill_color="color",
+                                 line_color="black", line_width=1)
+    below_items.append(LegendItem(label={"field": "name"},
+                                  renderers=[stations_r]))
+    map_fig.add_tools(HoverTool(renderers=[stations_r], tooltips=[
+        ("", "@name"), *POS_TOOLTIPS], formatters=HOVER_FMT))
 map_fig.legend.location = "top_right"
 map_fig.legend.label_text_font_size = "10px"
 map_fig.legend.padding = 3
 map_fig.legend.background_fill_alpha = 0.7
+if below_items:
+    map_fig.add_layout(Legend(items=below_items, orientation="horizontal",
+                              label_text_font_size="10px", padding=3,
+                              spacing=12, border_line_color=None), "below")
 map_fig.add_tools(HoverTool(renderers=[ends_r, now_r], tooltips=[
-    ("", "@label"), ("time", "@t{%m/%d %H:%M}"),
-    ("pos", "@lat{0.0000}, @lon{0.0000}")], formatters={"@t": "datetime"}))
-map_fig.add_tools(HoverTool(renderers=[beacon_r], tooltips=[
-    ("", f"Beacon {cfg.BEACON_NAME}"), ("time", "@t{%m/%d %H:%M}"),
-    ("pos", "@lat{0.0000}, @lon{0.0000}")], formatters={"@t": "datetime"}))
+    ("", "@label"), ("time", "@t{%m/%d %H:%M:%S}"),
+    *POS_TOOLTIPS], formatters=HOVER_FMT))
 map_fig.add_tools(HoverTool(renderers=[track_r], tooltips=[
-    ("time", "@t{%m/%d %H:%M}"), ("value", "@val{0.000}"),
-    ("pos", "@lat{0.0000}, @lon{0.0000}")], formatters={"@t": "datetime"}))
+    ("time", "@t{%m/%d %H:%M:%S}"), ("value", "@val{0.000}"),
+    *POS_TOOLTIPS], formatters=HOVER_FMT))
 track_cbar = ColorBar(color_mapper=track_mapper, width=12,
                       title=color_select.value)
 map_fig.add_layout(track_cbar, "right")
@@ -248,10 +310,9 @@ uv_srcs, uv_bands, uv_figs = {}, {}, {}
 for comp in ("u", "v"):
     f = figure(width=720, height=190, x_axis_type="datetime",
                x_range=time_range,
-               y_range=Range1d(cfg.ADCP_ZMAX_PLOT, 0),
+               y_range=Range1d(ZPLOT0, 0),
                tools="xpan,xwheel_zoom,reset,save", y_axis_label="Depth (m)",
-               title=f"ADCP {cfg.SONAR} {comp} (m/s, "
-                     f"{'east' if comp == 'u' else 'north'})")
+               title=f"ADCP {comp}")
     f.xaxis.formatter = DATETIME_FMT
     uv_srcs[comp] = ColumnDataSource(dict(image=[], x=[], y=[], dw=[], dh=[]))
     r = f.image("image", x="x", y="y", dw="dw", dh="dh",
@@ -371,7 +432,13 @@ def on_time_tap(event):
 
 
 def on_map_tap(event):
-    """Put the marker at the time of the track point nearest the click."""
+    """Put the marker at the time of the track point nearest the click, or
+    with Calculate distance on, pick a distance end point."""
+    if dist_btn.active:
+        pts = STATE["dist"] if len(STATE["dist"]) < 2 else []
+        STATE["dist"] = pts + [(event.x, event.y)]
+        draw_dist()
+        return
     met = STATE["met"]
     if not {"lon", "lat"} <= set(met):
         return
@@ -389,16 +456,54 @@ def clear_mark(event):
     draw_mark()
 
 
+def great_circle(lon1, lat1, lon2, lat2):
+    """Distance (km) and initial bearing (deg T) from point 1 to point 2."""
+    p1, p2 = np.radians(lat1), np.radians(lat2)
+    dl = np.radians(lon2 - lon1)
+    a = np.sin((p2 - p1) / 2) ** 2 + np.cos(p1) * np.cos(p2) * np.sin(dl / 2) ** 2
+    km = 2 * 6371.0 * np.arcsin(np.sqrt(a))
+    brg = np.degrees(np.arctan2(np.sin(dl) * np.cos(p2),
+                                np.cos(p1) * np.sin(p2)
+                                - np.sin(p1) * np.cos(p2) * np.cos(dl))) % 360
+    return km, brg
+
+
+def draw_dist():
+    """Show the Calculate distance points, their positions and distance."""
+    pts = STATE["dist"] if dist_btn.active else []
+    dist_src.data = dict(lon=[p[0] for p in pts], lat=[p[1] for p in pts])
+    if not dist_btn.active:
+        dist_div.text = ""
+        return
+    rows = [f"<b>{k}</b> {lat:.5f}, {lon180(lon):.5f} "
+            f"({ddm(lat, 'N', 'S')}, {ddm(lon180(lon), 'E', 'W')})"
+            for k, (lon, lat) in zip("AB", pts)]
+    if len(pts) == 2:
+        km, brg = great_circle(*pts[0], *pts[1])
+        rows.append(f"<b>Distance</b> {km:.2f} km ({km / 1.852:.2f} nm), "
+                    f"bearing A to B {brg:.0f}° T")
+    rows.append(["<i>Click the first point on the map.</i>",
+                 "<i>Click the second point.</i>",
+                 "<i>Click again to start a new measurement.</i>"][len(pts)])
+    dist_div.text = (f"<div style='font-size:12px; color:{DIST_COLOR}'>"
+                     + "<br>".join(rows) + "</div>")
+
+
+def on_dist_toggle(attr, old, new):
+    STATE["dist"] = []
+    draw_dist()
+
+
 def ddm(x, pos, neg):
     hemi = pos if x >= 0 else neg
     x = abs(x)
     return f"{int(x)}° {60 * (x % 1):06.3f}' {hemi}"
 
 
-def adcp_image(ds, comp):
+def adcp_image(ds, comp, zplot):
     """Regularly gridded (depth x time) image of u or v for bokeh.image."""
     z = readers.bin_depths(ds)
-    keep = z <= cfg.ADCP_ZMAX_PLOT
+    keep = z <= zplot
     zdim = [d for d in ds[comp].dims if d != "time"][0]
     t = ds["time"].values
     dt = np.median(np.diff(t)) if t.size > 1 else np.timedelta64(180, "s")
@@ -534,16 +639,31 @@ def update():
     except Exception as e:
         warnings.append(f"MET: {e}")
     ds_all = None
-    if cfg.ADCP_FILE is not None:
+    sonar = cfg.SONARS[sonar_btn.active] if cfg.SONARS else None
+    if sonar is not None:
         try:
-            ds_all = readers.read_adcp(cfg.ADCP_FILE)
+            ds_all = readers.read_adcp(cfg.ADCP_FILES[sonar])
             ds_all = ds_all.assign(lon=ds_all["lon"].copy(
                 data=wrap_lon(ds_all["lon"])))
             t_adcp_first = pd.Timestamp(ds_all["time"].values[0])
             t_adcp_last = pd.Timestamp(ds_all["time"].values[-1])
         except Exception as e:
             ds_all = None
-            warnings.append(f"ADCP: {e}")
+            warnings.append(f"ADCP {sonar}: {e}")
+
+    # --- depth axis of the u/v sections and depth slider follow the sonar
+    zplot = zrange.end
+    if ds_all is not None:
+        zplot = cfg.ADCP_ZMAX_PLOT or float(
+            np.ceil(np.nanmax(readers.bin_depths(ds_all)) / 50) * 50)
+    zrange.end = zplot
+    if zmax > zplot:  # e.g. back from os75 to os150 with a deep range
+        zmin, zmax = cfg.ADCP_ZRANGE
+        zrange.value = (zmin, zmax)
+    for comp, f in uv_figs.items():
+        f.y_range.start = zplot
+        f.title.text = (f"ADCP {sonar or ''} {comp} (m/s, "
+                        f"{'east' if comp == 'u' else 'north'})")
 
     # --- time window from the start/end sliders
     firsts = [t for t in (t_met_first, t_adcp_first) if t is not None]
@@ -606,25 +726,21 @@ def update():
         except Exception as e:
             warnings.append(f"SST: {e}")
     bathy_r.visible = not show_sst
-    sst_r.visible = sst_cbar.visible = show_sst
-    # outline the track dots so they stand out on the SST colors
-    track_r.glyph.line_color = "black" if show_sst else None
-    map_fig.title.text = ("Ship track" if not show_sst else
-                          f"Ship track on {cfg.SST_NAME}, "
-                          + (f"{t_sst:%Y-%m-%d}" if t_sst is not None
-                             else "not available"))
+    sst_r.visible = show_sst
 
-    # --- mooring beacon
-    beacon = pd.DataFrame()
-    try:
-        beacon = readers.read_beacon(cfg.BEACON_DIR, t0=cfg.BEACON_START)
-    except Exception as e:
-        warnings.append(f"Beacon: {e}")
-    t_beacon = beacon.index[-1] if len(beacon) else None
-    bwin = beacon.loc[t0:t1] if len(beacon) else beacon
-    beacon_src.data = dict(lon=wrap_lon(bwin["lon"]) if len(bwin) else [],
-                           lat=bwin["lat"].values if len(bwin) else [],
-                           t=bwin.index.values if len(bwin) else [])
+    # --- tracked items (moorings, drifters, ...)
+    tracked = []  # (item, all its fixes) for the readout
+    for item, src in zip(cfg.TRACKED, tracked_srcs):
+        fixes = pd.DataFrame()
+        try:
+            fixes = readers.read_positions(item["dir"], t0=item.get("start"))
+        except Exception as e:
+            warnings.append(f"{item['name']}: {e}")
+        tracked.append((item, fixes))
+        win = fixes.loc[t0:t1] if len(fixes) else fixes
+        src.data = dict(lon=wrap_lon(win["lon"]) if len(win) else [],
+                        lat=win["lat"].values if len(win) else [],
+                        t=win.index.values if len(win) else [])
 
     # --- ADCP
     ds = None
@@ -634,7 +750,7 @@ def update():
             ds = None
     if ds is not None:
         ubar, vbar = readers.depth_avg(ds, zmin, zmax)
-        imgs = {c: adcp_image(ds, c) for c in ("u", "v")}
+        imgs = {c: adcp_image(ds, c, zplot) for c in ("u", "v")}
         for c in ("u", "v"):
             uv_srcs[c].data = imgs[c]
         lim = max(0.2, robust_limits(np.abs(np.concatenate(
@@ -661,17 +777,36 @@ def update():
         tr = dict(lon=[], lat=[], t=[], val=[])
     track_src.data = tr
     lo, hi = robust_limits(tr["val"])
-    track_mapper.update(palette=palette, low=lo, high=hi)
     track_cbar.title = (f"{color_select.value} ({units})"
                         if src_kind == "met" else
                         f"ADCP speed {zmin:.0f}-{zmax:.0f} m ({units})")
+    # Track colored by a water temperature on the SST background: put both
+    # on one color scale (and colorbar) so ship and satellite SST can be
+    # compared directly. Otherwise the title gives the satellite SST range.
+    title = "Ship track"
+    if show_sst:
+        title += (f" on {cfg.SST_NAME}, {t_sst:%Y-%m-%d}"
+                  if t_sst is not None else f" ({cfg.SST_NAME} not available)")
+    if show_sst and t_sst is not None:
+        if col in ("sst", "tsg_t"):
+            lo, hi = min(lo, sst_mapper.low), max(hi, sst_mapper.high)
+            sst_mapper.update(low=lo, high=hi)
+            track_cbar.title = ("Underway and satellite SST (°C)"
+                                if col == "sst" else
+                                "TSG temperature and satellite SST (°C)")
+        else:
+            title += (f" ({sst_mapper.low:.1f}-{sst_mapper.high:.1f} °C)")
+    map_fig.title.text = title
+    track_mapper.update(palette=palette, low=lo, high=hi)
 
     # --- map extent: fit to the track once (or on Zoom to track), then
     # keep the user's zoom unless Auto-zoom is on
     if autozoom.active or not STATE["zoomed"]:
         STATE["zoomed"] = set_map_ranges(
-            np.r_[line_src.data["lon"], tr["lon"], beacon_src.data["lon"]],
-            np.r_[line_src.data["lat"], tr["lat"], beacon_src.data["lat"]])
+            np.concatenate([line_src.data["lon"], tr["lon"],
+                            *[s.data["lon"] for s in tracked_srcs]]),
+            np.concatenate([line_src.data["lat"], tr["lat"],
+                            *[s.data["lat"] for s in tracked_srcs]]))
     draw_mark()
 
     # --- ADCP vectors
@@ -729,21 +864,23 @@ def update():
                      f"{spd:.2f} m/s ({spd / KN2MS:.1f} kn) toward "
                      f"{toward:.0f}° &nbsp; [u={ubar[i]:+.2f}, "
                      f"v={vbar[i]:+.2f}]"))
-    if len(beacon):
-        b = beacon.iloc[-1]
-        rows.append((f"Beacon {cfg.BEACON_NAME} (latest)",
-                     f"{b['lat']:.5f}, {b['lon']:.5f} &nbsp; "
-                     f"({ddm(b['lat'], 'N', 'S')}, {ddm(b['lon'], 'E', 'W')})"))
+    for item, fixes in tracked:
+        if len(fixes):
+            b = fixes.iloc[-1]
+            lon = lon180(b["lon"])
+            rows.append((f"{item['name']} (latest)",
+                         f"{b['lat']:.5f}, {lon:.5f} &nbsp; "
+                         f"({ddm(b['lat'], 'N', 'S')}, {ddm(lon, 'E', 'W')})"))
+    ages = [age_html("MET", t_met_last, now, cfg.MET_STALE_MIN),
+            age_html(f"ADCP {sonar or ''}", t_adcp_last, now, cfg.ADCP_STALE_MIN)]
+    ages += [age_html(item["name"], fixes.index[-1] if len(fixes) else None,
+                      now, item.get("stale_min", cfg.TRACKED_STALE_MIN))
+             for item, fixes in tracked]
     table = "".join(f"<tr><td style='padding-right:12px'><b>{k}</b></td>"
                     f"<td>{v}</td></tr>" for k, v in rows)
     readout.text = (f"<table style='font-size:13px'>{table}</table>"
                     f"<div style='font-size:12px'>"
-                    f"{age_html('MET', t_met_last, now, cfg.MET_STALE_MIN)}"
-                    f" &nbsp;|&nbsp; "
-                    f"{age_html('ADCP', t_adcp_last, now, cfg.ADCP_STALE_MIN)}"
-                    f" &nbsp;|&nbsp; "
-                    f"{age_html('Beacon', t_beacon, now, cfg.BEACON_STALE_MIN)}"
-                    f"</div>")
+                    + " &nbsp;|&nbsp; ".join(ages) + "</div>")
 
     msg = (f"<b>{cfg.CRUISE}</b> &nbsp; last refresh {now:%H:%M:%S} UTC "
            f"(every {cfg.REFRESH_S} s) &nbsp; window {t0:%m/%d %H:%M} to "
@@ -796,6 +933,7 @@ def on_zoom():
 
 
 zoom_btn.on_click(on_zoom)
+dist_btn.on_change("active", on_dist_toggle)
 map_fig.on_event(Tap, on_map_tap)
 for f in time_figs:
     f.on_event(Tap, on_time_tap)
@@ -810,7 +948,7 @@ end_slide.on_change("value_throttled", on_end_release)
 for w, attr in [(color_select, "value"),
                 (zrange, "value_throttled"), (vec_mode, "active"),
                 (follow, "active"), (autozoom, "active"),
-                (basemap, "active")]:
+                (basemap, "active"), (sonar_btn, "active")]:
     w.on_change(attr, on_change)
 
 controls = column(
@@ -820,8 +958,11 @@ controls = column(
     zrange,
     row(window_div, follow, autozoom, zoom_btn),
     row(color_select, column(Div(text="&nbsp;", height=12), vec_mode)),
-    row(Div(text="Map background:", styles={"margin-top": "6px"}), basemap),
+    row(Div(text="Map background:", styles={"margin-top": "6px"}), basemap,
+        *([Div(text="ADCP:", styles={"margin-top": "6px"}), sonar_btn]
+          if cfg.SONARS else [])),
     mark_div,
+    row(dist_btn, dist_div),
 )
 layout = row(column(controls, map_fig),
              column(readout, uv_figs["u"], uv_figs["v"], *ts_figs))

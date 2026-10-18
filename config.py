@@ -33,11 +33,11 @@ MET_COLUMNS = {
     "depth": "MB",                       # multibeam depth
 }
 
-# UHDAS ADCP contour file. os75 is out of commission on RR2609, so default
-# to os150nb. Set ADCP_FILE = None if there is no ADCP.
-SONAR = "os150nb"
-ADCP_FILE = (CRUISE_DIR / "adcp_uhdas" / CRUISE / "proc" / SONAR / "contour"
-             / f"{SONAR}.nc")
+# UHDAS ADCP contour files, one per sonar, picked with the "ADCP" buttons.
+# The first is the default. Set SONARS = [] if there is no ADCP.
+SONARS = ["os150nb", "os75nb"]
+ADCP_FILES = {s: CRUISE_DIR / "adcp_uhdas" / CRUISE / "proc" / s / "contour"
+              / f"{s}.nc" for s in SONARS}
 
 # Bathymetry for the basemap: netCDF with 1-D lon/lat (or x/y) and depth
 # or elevation (z, elevation, ...; negative is ocean). Subset it to the
@@ -54,12 +54,29 @@ LON_0_360 = False
 SST_BOX = None
 SST_HALF_DEG = 1.5
 
-# Drifting mooring beacon (Xeos 1374, EK80 mooring). Every *.csv in this
-# folder is read and merged, so new CSVs from Slack can just be dropped in.
-# An empty or missing folder just shows no beacon.
-BEACON_DIR = HERE / "beacon"
-BEACON_NAME = "Xeos 1374"
-BEACON_START = "2026-10-17 10:00"        # UTC; ignore older fixes (or None)
+# Other things to track on the map (drifting moorings, drifters, gliders,
+# small boats, ...): position fixes from every *.csv in "dir", merged, so new
+# CSVs can just be dropped in. Each CSV needs time (UTC), lat and lon
+# columns. Optional keys: "start" (UTC; ignore older fixes), "color",
+# "marker" (a Bokeh marker name), "stale_min" (age shown red after this).
+# Delete an entry when it's no longer needed, or set TRACKED = [].
+# Example (RR2609, the EK80 mooring that broke free, recovered 2026-10-17):
+#   {"name": "Xeos 1374 (EK80 mooring)", "dir": HERE / "beacon",
+#    "start": "2026-10-17 10:00", "color": "red", "stale_min": 90},
+TRACKED = []
+
+# Fixed positions to mark on the map (deployed moorings, stations, ...).
+# Keys: "name", "lat", "lon" (decimal deg), and optional "marker" (a Bokeh
+# marker name, e.g. triangle, inverted_triangle, square, diamond, circle)
+# and "color".
+STATIONS = [
+    {"name": "YT source", "lat": 35.66402, "lon": -122.00135,
+     "marker": "inverted_triangle", "color": "green"},
+    {"name": "YT VLA", "lat": 35.65855, "lon": -122.00246,
+     "marker": "triangle", "color": "yellow"},
+    {"name": "YT EK80", "lat": 35.65263, "lon": -122.00201,
+     "marker": "square", "color": "hotpink"},
+]
 # ======================================================== end CRUISE SETUP
 
 BATHY_STRIDE = 2                         # decimate grid for plotting speed
@@ -84,10 +101,10 @@ WINDOW_MAX_H = 72.0                      # longest allowed window (h)
 WINDOW_STEP_MIN = 5                      # start/end slider step (min)
 NUDGE_MIN = 15                           # start/end button step (min)
 ADCP_ZRANGE = (20, 50)                   # default depth-average range (m)
-ADCP_ZMAX_PLOT = 400                     # max depth on u/v sections (m)
+ADCP_ZMAX_PLOT = None                    # max depth on u/v sections (m), None = deepest bin
 MAX_VECTORS = 60                         # subsample ADCP vectors on the map
 
 # Flag data as stale (red in the readout) if older than this (min)
 MET_STALE_MIN = 15
 ADCP_STALE_MIN = 30
-BEACON_STALE_MIN = 90
+TRACKED_STALE_MIN = 90                   # default for TRACKED entries

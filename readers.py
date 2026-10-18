@@ -1,4 +1,5 @@
-"""Readers for shipboard MetAcq, UHDAS ADCP, beacon, satellite SST, and
+"""Readers for shipboard MetAcq, UHDAS ADCP, tracked positions, satellite SST,
+and
 bathymetry files.
 
 These are plain functions (no Bokeh) so they can be tested on their own.
@@ -135,11 +136,12 @@ def met_time_span(met_dir, pattern=MET_FILE, missing=MET_MISSING,
             last.index[-1] if len(last) else None)
 
 
-# ---------------------------------------------------------------- beacon
-def _read_beacon_file(path):
-    """One CSV of beacon GPS fixes. Finds the time, lat and lon columns by
-    name (e.g. "Timestamp"/"time_utc", "Lat"/"latitude", "Lon"/"longitude"),
-    so the CSVs relayed on Slack and hand-made ones both work."""
+# ------------------------------------------------- tracked position fixes
+def _read_positions_file(path):
+    """One CSV of position fixes (e.g. a mooring beacon). Finds the time,
+    lat and lon columns by name (e.g. "Timestamp"/"time_utc", "Lat"/
+    "latitude", "Lon"/"longitude"), so the CSVs relayed on Slack and
+    hand-made ones both work."""
     df = pd.read_csv(path, sep=None, engine="python", comment="#")
     cols = {c.lower().strip(): c for c in df.columns}
 
@@ -159,15 +161,15 @@ def _read_beacon_file(path):
     return out.dropna()
 
 
-def read_beacon(beacon_dir, t0=None, t1=None):
-    """All beacon fixes from the *.csv files in beacon_dir, merged, sorted
+def read_positions(pos_dir, t0=None, t1=None):
+    """All position fixes from the *.csv files in pos_dir, merged, sorted
     by time and with duplicate times dropped. Returns a DataFrame (lat, lon)
     indexed by naive UTC time, empty if there are no files."""
-    files = sorted(Path(beacon_dir).glob("*.csv"))
+    files = sorted(Path(pos_dir).glob("*.csv"))
     if not files:
         return pd.DataFrame(columns=["lat", "lon"],
                             index=pd.DatetimeIndex([]))
-    df = pd.concat([_cached(f, _read_beacon_file) for f in files])
+    df = pd.concat([_cached(f, _read_positions_file) for f in files])
     df = df[~df.index.round("s").duplicated(keep="last")].sort_index()
     if t0 is not None or t1 is not None:
         df = df.loc[t0:t1]
