@@ -13,20 +13,27 @@ Everything re-reads every 60 s. Files are cached by modification time, so a refr
 
 ## Running it
 
-One-time setup:
+One-time setup (on any computer):
 
 ```
-cd ~/Dropbox/SIO/projects/muri/situational_awareness
+git clone https://github.com/nicolecouto/situational_awareness.git
+cd situational_awareness
 conda env create -f environment.yml
 ```
 
-Mount the cruise share in Finder (Go > Connect to Server, `smb://rr-sci-filesvr.ucsd.edu/cruise`). It should then appear at `/Volumes/cruise/RR2609`.
+Mount the cruise share in Finder (Go > Connect to Server, `smb://rr-sci-filesvr.ucsd.edu/cruise`). It should then appear at `/Volumes/cruise/RR2609`. If it is mounted somewhere else (e.g. `/Volumes/cruise-1` when a second share of the same name is already mounted, or `/mnt/cruise` on Linux), point the dashboard at it with an environment variable rather than editing `config.py`:
 
-Start the dashboard:
+```
+export CRUISE_SHARE=/Volumes/cruise-1
+```
+
+The bathymetry file is in the repo (`bathy/muri_bathy.nc`), so nothing else needs to be copied over. To get the latest code later, run `git pull` in the repo folder.
+
+Start the dashboard from the folder that contains the repo:
 
 ```
 conda activate muri-sea
-cd ~/Dropbox/SIO/projects/muri
+cd ..
 bokeh serve --show situational_awareness
 ```
 
@@ -66,10 +73,11 @@ Everything that changes from cruise to cruise is in the **CRUISE SETUP** block a
 - `readers.py` - readers for MetAcq, UHDAS ADCP, tracked-position CSVs, satellite SST and bathymetry (no Bokeh, can be used on their own)
 - `config.py` - paths, sonar, refresh rate, defaults. **Edit the CRUISE SETUP block for a new cruise.**
 - `environment.yml` - conda environment `muri-sea`
+- `bathy/muri_bathy.nc` - bathymetry basemap for the cruise area
 
 ## Data sources
 
-All shipboard data come from the cruise share **`smb://rr-sci-filesvr.ucsd.edu/cruise/RR2609`**, mounted locally at **`/Volumes/cruise/RR2609`**. The share's overview of the instruments is in `/Volumes/cruise/RR2609/RR2609_README.txt`.
+All shipboard data come from the cruise share **`smb://rr-sci-filesvr.ucsd.edu/cruise/RR2609`**, mounted locally at **`/Volumes/cruise/RR2609`** (or `$CRUISE_SHARE/RR2609` if `CRUISE_SHARE` is set). The share's overview of the instruments is in `/Volumes/cruise/RR2609/RR2609_README.txt`.
 
 ### MetAcq underway system (navigation, met, TSG, SST)
 
@@ -122,6 +130,6 @@ All shipboard data come from the cruise share **`smb://rr-sci-filesvr.ucsd.edu/c
 
 ### Bathymetry
 
-- **Data:** `/Users/ncouto/Dropbox/SIO/projects/muri/Planning/bathy/muri_bathy.nc` (`BATHY_FILE`, optional)
+- **Data:** `bathy/muri_bathy.nc` in this repo (`BATHY_FILE`, optional), copied from `muri/planning/bathy/muri_bathy.nc`
 - **Contents:** variables `lat`, `lon`, `z` (m, negative is ocean), covering 34.8-37 N, 124-121 W. It is plotted at every 2nd point (`BATHY_STRIDE`). Isobaths are 100, 200, 500, 1000, 2000, 3000 and 4000 m, and the z = 0 contour serves as the coastline.
 - **Caveat:** outside this box (e.g. north of 37 N toward San Francisco) the track is drawn on a blank background. Switch to the SST background there.

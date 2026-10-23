@@ -4,3 +4,4 @@ __pycache__/
 beacon/
 sst/
 tracked/
+*.mat

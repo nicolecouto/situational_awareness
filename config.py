@@ -4,6 +4,7 @@ For a new cruise, edit the CRUISE SETUP block below (names and paths). The
 rest are display defaults that rarely need changing. See README.md for
 what each data source is and where it lives.
 """
+import os
 from pathlib import Path
 
 HERE = Path(__file__).parent
@@ -12,7 +13,9 @@ HERE = Path(__file__).parent
 CRUISE = "RR2609"
 
 # Cruise share (smb://rr-sci-filesvr.ucsd.edu/cruise/RR2609), mounted by Finder
-CRUISE_DIR = Path("/Volumes/cruise") / CRUISE
+# at /Volumes/cruise. If it's mounted elsewhere on this computer, set the
+# CRUISE_SHARE environment variable to the mount point instead of editing this.
+CRUISE_DIR = Path(os.environ.get("CRUISE_SHARE", "/Volumes/cruise")) / CRUISE
 
 # Underway (nav, met, TSG) data: one file per UTC day in MET_DIR, named by
 # the strftime pattern MET_FILE. Only the MetAcq "Met Data - Corrected"
@@ -43,8 +46,9 @@ ADCP_FILES = {s: CRUISE_DIR / "adcp_uhdas" / CRUISE / "proc" / s / "contour"
 
 # Bathymetry for the basemap: netCDF with 1-D lon/lat (or x/y) and depth
 # or elevation (z, elevation, ...; negative is ocean). Subset it to the
-# cruise area first. Set to None for no bathymetry.
-BATHY_FILE = Path("/Users/ncouto/Dropbox/SIO/projects/muri/Planning/bathy/muri_bathy.nc")
+# cruise area first, and keep it in bathy/ so it travels with the repo. Set
+# to None for no bathymetry.
+BATHY_FILE = HERE / "bathy" / "muri_bathy.nc"
 
 # Use 0-360 longitudes everywhere. Set True if the cruise crosses 180°
 # (e.g. the Ross Sea), so the track doesn't jump across the map.
