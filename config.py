@@ -22,10 +22,12 @@ MET_FILE = "%y%m%d.MET"
 MET_MISSING = -99
 # Dashboard name: column name in the underway files. Drop a line if the
 # ship doesn't have it. Units expected: lat/lon decimal deg, sog knots,
-# cog and wind_dir deg (wind coming from), wind m/s, temperatures °C.
+# cog and wind_dir deg (wind coming from), wind m/s, temperatures °C,
+# stw (forward) and stw_x (starboard) speed through water in knots.
 MET_COLUMNS = {
     "lat": "LA", "lon": "LO",            # Seapath GPS
     "cog": "CR", "sog": "SP",
+    "stw": "SL", "stw_x": "SX",          # UHDAS OS150 speed log
     "sst": "ST",                         # SBE38, bow thruster intake
     "tsg_t": "TT", "sal": "SA",          # SBE45 TSG
     "fluor": "FL",
@@ -76,6 +78,11 @@ STATIONS = [
      "marker": "triangle", "color": "yellow"},
     {"name": "YT EK80", "lat": 35.65263, "lon": -122.00201,
      "marker": "square", "color": "hotpink"},
+    # From planning/sarah/June25_M1200_N3320.ipynb
+    {"name": "M1200", "lat": 35.6437, "lon": -122.0020,
+     "marker": "circle", "color": "red"},
+    {"name": "N3320", "lat": 36.1007, "lon": -122.5992,
+     "marker": "circle", "color": "red"},
 ]
 # ======================================================== end CRUISE SETUP
 
@@ -103,6 +110,7 @@ NUDGE_MIN = 15                           # start/end button step (min)
 ADCP_ZRANGE = (20, 50)                   # default depth-average range (m)
 ADCP_ZMAX_PLOT = None                    # max depth on u/v sections (m), None = deepest bin
 MAX_VECTORS = 60                         # subsample ADCP vectors on the map
+SPEED_SMOOTH_S = 120                     # running mean on SOG/STW plots (s)
 
 # Flag data as stale (red in the readout) if older than this (min)
 MET_STALE_MIN = 15

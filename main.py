@@ -47,6 +47,7 @@ COLOR_VARS = {
     "Salinity":             ("met", "sal", "psu", cmo_palette("haline")),
     "Fluorescence":         ("met", "fluor", "µg/l", cmo_palette("algae")),
     "Ship speed (SOG)":     ("met", "sog", "kn", cmo_palette("speed")),
+    "Ship speed (STW)":     ("met", "stw", "kn", cmo_palette("speed")),
     "ADCP speed (z range)": ("adcp", None, "m/s", cmo_palette("speed")),
 }
 VECTOR_MODES = ["No vectors", "Shallowest bin", "Depth range"]
@@ -147,6 +148,7 @@ basemap = RadioButtonGroup(labels=BASEMAPS, active=0)
 sonar_btn = RadioButtonGroup(labels=cfg.SONARS, active=0)
 follow = Checkbox(label="Follow latest", active=True)
 autozoom = Checkbox(label="Auto-zoom map", active=False)
+show_stations = Checkbox(label="Show moorings", active=True)
 zoom_btn = Button(label="Zoom to track", width=110)
 MARK_COLOR = "#ff7f00"
 mark_div = Div(text="", width=650)
@@ -284,6 +286,7 @@ if cfg.STATIONS:
                                   renderers=[stations_r]))
     map_fig.add_tools(HoverTool(renderers=[stations_r], tooltips=[
         ("", "@name"), *POS_TOOLTIPS], formatters=HOVER_FMT))
+    show_stations.js_link("active", stations_r, "visible")
 map_fig.legend.location = "top_right"
 map_fig.legend.label_text_font_size = "10px"
 map_fig.legend.padding = 3
@@ -329,11 +332,15 @@ for comp in ("u", "v"):
 # --------------------------------------------------- underway time series
 ts_src = ColumnDataSource(dict(t=[], ST=[], TT=[], SA=[], TW=[], TI=[],
                                SP=[]))
+SMOOTH_LABEL = f"{cfg.SPEED_SMOOTH_S:g} s mean"
 ts_specs = [  # (title, [(column, color, legend)])
     ("Temperature (°C)", [("sst", "#c0392b", "SST"), ("tsg_t", "#2c7fb8", "TSG")]),
     ("Salinity (psu)", [("sal", "#1b9e77", None)]),
     ("True wind (m/s)", [("wind", "#555555", None)]),
-    ("Ship speed (kn)", [("sog", "#7570b3", None)]),
+    ("Speed over ground (kn)", [("sog", "#bcbddc", "raw"),
+                                ("sog_s", "#7570b3", SMOOTH_LABEL)]),
+    ("Speed through water, forward (kn)", [("stw", "#fdbe85", "raw"),
+                                           ("stw_s", "#d95f02", SMOOTH_LABEL)]),
 ]
 ts_figs = []
 for title, lines in ts_specs:
@@ -418,7 +425,8 @@ def draw_mark():
     g = met.loc[t].get
     vals = " &nbsp; ".join(
         f"{lab} {g(c):{fmt}}" for c, lab, fmt in
-        [("sst", "SST", ".3f"), ("sal", "S", ".3f"), ("sog", "SOG", ".1f")]
+        [("sst", "SST", ".3f"), ("sal", "S", ".3f"), ("sog", "SOG", ".1f"),
+         ("stw", "STW", ".1f")]
         if c in met and np.isfinite(g(c)))
     mark_div.text = (f"<span style='color:{MARK_COLOR}'>&#9670;</span> "
                      f"<b>Marker</b> {t:%m/%d %H:%M:%S} UTC &nbsp; "
@@ -687,10 +695,14 @@ def update():
     STATE["met"] = met
     if len(met):
         line_src.data = dict(lon=met["lon"].values, lat=met["lat"].values)
+        smooth = met[[c for c in ("sog", "stw") if c in met]].rolling(
+            f"{cfg.SPEED_SMOOTH_S}s", center=True).mean().add_suffix("_s")
+        met_ts = met.join(smooth)
         ts_src.data = {"t": met.index.values,
-                       **{c: met[c].values if c in met else
+                       **{c: met_ts[c].values if c in met_ts else
                           np.full(len(met), np.nan)
-                          for c in ("sst", "tsg_t", "sal", "wind", "wind_dir", "sog")}}
+                          for c in ("sst", "tsg_t", "sal", "wind", "wind_dir",
+                                    "sog", "sog_s", "stw", "stw_s")}}
         pos = met[["lon", "lat"]].dropna()
         ends = pos.iloc[[0, -1]] if len(pos) else pos
         ends_src.data = dict(lon=ends["lon"].values, lat=ends["lat"].values,
@@ -849,6 +861,7 @@ def update():
                          f"({ddm(g('lat'), 'N', 'S')}, "
                          f"{ddm(lon180(g('lon')), 'E', 'W')})"),
             ("SOG / COG", f"{g('sog'):.1f} kn / {g('cog'):.0f}°"),
+            ("STW (fwd / stbd)", f"{g('stw'):+.1f} / {g('stw_x'):+.1f} kn"),
             ("SST / TSG T / S", f"{g('sst'):.3f} °C / {g('tsg_t'):.3f} °C / "
                                 f"{g('sal'):.3f} psu"),
             ("True wind", f"{g('wind'):.1f} m/s ({g('wind') / KN2MS:.0f} kn) "
@@ -956,7 +969,8 @@ controls = column(
     row(start_slide, nudge_group("start")),
     row(end_slide, nudge_group("end")),
     zrange,
-    row(window_div, follow, autozoom, zoom_btn),
+    row(window_div, follow, autozoom, zoom_btn,
+        *([show_stations] if cfg.STATIONS else [])),
     row(color_select, column(Div(text="&nbsp;", height=12), vec_mode)),
     row(Div(text="Map background:", styles={"margin-top": "6px"}), basemap,
         *([Div(text="ADCP:", styles={"margin-top": "6px"}), sonar_btn]
