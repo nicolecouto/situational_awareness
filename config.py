@@ -10,9 +10,9 @@ from pathlib import Path
 HERE = Path(__file__).parent
 
 # ============================================================ CRUISE SETUP
-CRUISE = "RR2609"
+CRUISE = "RR2610"
 
-# Cruise share (smb://rr-sci-filesvr.ucsd.edu/cruise/RR2609), mounted by Finder
+# Cruise share (smb://rr-sci-filesvr.ucsd.edu/cruise/<CRUISE>), mounted by Finder
 # at /Volumes/cruise. If it's mounted elsewhere on this computer, set the
 # CRUISE_SHARE environment variable to the mount point instead of editing this.
 CRUISE_DIR = Path(os.environ.get("CRUISE_SHARE", "/Volumes/cruise")) / CRUISE
